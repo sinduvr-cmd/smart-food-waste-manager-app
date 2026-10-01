@@ -1,6 +1,14 @@
 # 🌱 Smart Food Waste Management System
 ### Python & Streamlit Coursework / Student Assignment Submission
 
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://smartfoodwastemanagerapp.streamlit.app/)
+[![GitHub Repository](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/sinduvr-cmd/smart-food-waste-manager-app)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+
+🌐 **Live Streamlit App**: [https://smartfoodwastemanagerapp.streamlit.app/](https://smartfoodwastemanagerapp.streamlit.app/)  
+📂 **GitHub Source Code**: [https://github.com/sinduvr-cmd/smart-food-waste-manager-app](https://github.com/sinduvr-cmd/smart-food-waste-manager-app)  
+🚀 **1-Click Community Cloud Deploy**: [Deploy on Streamlit Cloud](https://share.streamlit.io/deploy?repository=sinduvr-cmd/smart-food-waste-manager-app&branch=main&mainModule=app.py)
+
 A responsive, sustainability-focused **Streamlit web application** that connects food donors (restaurants, hotels, catering venues, event organizers, and households) with NGOs, community kitchens, and volunteers before surplus food expires.
 
 > **Project Mission**: Aligning with **UN Sustainable Development Goal 2 (Zero Hunger)** and **UN SDG 12 (Responsible Consumption & Production)** to reduce methane emissions from landfills and feed communities in need through automated, transparent surplus food logistics.
