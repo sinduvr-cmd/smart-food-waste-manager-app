@@ -3,7 +3,7 @@
 
 🌐 **Live Web Application**: [Smart Food Waste Manager App](https://smart-food-waste-manager-app-3hepglndnhwu5o5phcj77w.streamlit.app/)  
 📂 **GitHub Repository**: [smart-food-waste-manager-app](https://github.com/sinduvr-cmd/smart-food-waste-manager-app)  
-🧪 **Unit Test Suite**: `test_app.py` (28/28 Unit Tests Passed • 100% Coverage)  
+🧪 **Unit Test Suite**: `test_app.py` (33/33 Unit Tests Passed • 100% Coverage)  
 💻 **Interactive CLI**: `python app.py --cli` (While-Loop Menu Options 1–8 + Enhancements)  
 
 ---
@@ -250,7 +250,7 @@ All 9 enhancement ideas from Section 12 are implemented in the project:
 
 ### Submission Deliverables Checklist
 - [x] **Python source file (`.py`):** `app.py` contains all core functions, business logic, CLI while loop, and web UI.
-- [x] **Test-case evidence:** 28 automated unit tests passing cleanly in `test_app.py` with 100% verification.
+- [x] **Test-case evidence:** 33 automated unit tests passing cleanly in `test_app.py` with 100% verification (including food safety quarantine and temperature zone validation).
 - [x] **Sample output:** Production-style terminal transcripts and Streamlit metrics included in this documentation.
 - [x] **Short README:** Detailed documentation explaining workflow, concepts, architecture, and setup instructions.
 - [x] **Optional deliverables:** CSV/JSON persistence, Streamlit web app, SQLite integration, logging, and unit tests.

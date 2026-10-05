@@ -729,6 +729,9 @@ def load_donations(file_path: str = FOOD_LISTINGS_FILE) -> list[dict[str, Any]]:
                     if "expiry_date" not in item:
                         item["expiry_date"] = str(item.get("expires_at", "2026-10-03"))[:10]
                 
+            # Quarantine any expired uncollected food batches to enforce food safety
+            sync_expired_statuses(data)
+
             # Keep food_listings.json synchronized if reading from legacy backup
             if target_file != FOOD_LISTINGS_FILE or not os.path.exists(FOOD_LISTINGS_FILE):
                 with open(FOOD_LISTINGS_FILE, "w", encoding="utf-8") as out_f:
@@ -1042,15 +1045,27 @@ def get_freshness_status(expires_at_str: str) -> dict[str, Any]:
     total_seconds = diff.total_seconds()
     delta_hours = total_seconds / 3600
 
-    if delta_hours <= 24:
+    if total_seconds <= 0:
+        mins_ago = int(abs(total_seconds) // 60)
+        hours_ago = mins_ago // 60
+        ago_str = f"{hours_ago}h {mins_ago % 60}m ago" if hours_ago > 0 else f"{mins_ago}m ago"
+        return {
+            "tier": "Expired",
+            "color": "gray",
+            "label": f"🚨 Expired ({ago_str})",
+            "is_expired": True,
+            "badge_html": f'<span style="background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; font-weight: 700; font-size: 0.75rem; padding: 4px 10px; border-radius: 9999px;">🚨 Expired ({ago_str})</span>'
+        }
+    elif delta_hours <= 24:
         hours = max(0, int(total_seconds // 3600))
         mins = max(0, int((total_seconds % 3600) // 60))
         time_text = f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
-        urgency_label = f"🔴 Collect Today ({time_text} left)" if delta_hours > 0 else "🔴 Collect Today (Immediate)"
+        urgency_label = f"🔴 Collect Today ({time_text} left)"
         return {
             "tier": "Red",
             "color": "red",
             "label": urgency_label,
+            "is_expired": False,
             "badge_html": f'<span style="background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; font-weight: 700; font-size: 0.75rem; padding: 4px 10px; border-radius: 9999px;">{urgency_label}</span>'
         }
     elif delta_hours <= 48:
@@ -1517,6 +1532,99 @@ def calculate_expiry_status(expires_at_str: str) -> dict[str, Any]:
             "is_urgent": False,
             "is_expired": False
         }
+
+
+def is_item_expired(
+    item: dict[str, Any],
+    current_time: Optional[Union[dt, datetime.date, str]] = None
+) -> bool:
+    """
+    Determine if a food inventory item has passed its safe consumption / expiry date.
+    
+    Demonstrates:
+    - Section 6 Validation & Business Rules: An expired item is one whose expiry date is earlier
+      than the current operating date. Expired food is strictly non-consumable and must be quarantined.
+    - Robust Parsing: Handles datetime strings ('YYYY-MM-DD HH:MM'), date-only ('YYYY-MM-DD'), and ISO format.
+    
+    Parameters:
+        item (dict[str, Any]): Food item dictionary with expiry date metadata.
+        current_time (Optional): Reference operating datetime or date (defaults to dt.now()).
+        
+    Returns:
+        bool: True if expired, False if still valid.
+    """
+    if not isinstance(item, dict):
+        return False
+
+    exp_val = item.get("expires_at") or item.get("expiry_date") or item.get("best_before") or item.get("best_before_date")
+    if not exp_val:
+        return False
+
+    # If current_time is specified (e.g. for coursework operating date simulations)
+    if current_time is not None:
+        stat = calculate_status(exp_val, current_date=current_time)
+        return stat == "EXPIRED"
+
+    # Default: compare against actual wall-clock datetime using calculate_expiry_status
+    exp_details = calculate_expiry_status(str(exp_val))
+    return bool(exp_details.get("is_expired", False))
+
+
+def get_effective_status(
+    item: dict[str, Any],
+    current_time: Optional[Union[dt, datetime.date, str]] = None
+) -> str:
+    """
+    Compute real-time operational status for a food item, taking into account fulfillment
+    and food safety expiry constraints.
+    
+    Food Safety Guarantee:
+    - Food items that have passed their safe expiry/use-by date can NEVER be 'Available'.
+    - If unfulfilled and expired, the effective status is strictly 'Expired' (quarantined).
+    
+    Returns:
+        'Completed' | 'Collected' | 'Depleted' | 'Expired' | 'Claimed' | 'Available'
+    """
+    raw_status = str(item.get("status", "Available")).strip()
+
+    # Completed or Collected items were successfully handed over prior to expiration
+    if raw_status in ["Completed", "Collected", "Depleted"]:
+        return raw_status
+
+    # If past expiry date/time, item cannot be Available or safely claimed
+    if is_item_expired(item, current_time=current_time):
+        return "Expired"
+
+    return raw_status
+
+
+def sync_expired_statuses(
+    inventory: list[dict[str, Any]],
+    current_time: Optional[Union[dt, datetime.date, str]] = None
+) -> int:
+    """
+    Enforce food safety by synchronizing inventory statuses with real-time expiry dates.
+    Any available or unclaimed food past its safe use-by timestamp is reclassified
+    as 'Expired' (quarantined for disposal/composting) and locked out of redistribution.
+    
+    Returns:
+        int: Number of items reclassified to Expired.
+    """
+    reclassified = 0
+    for item in inventory:
+        if not isinstance(item, dict):
+            continue
+        cur_status = str(item.get("status", "Available")).strip()
+        if cur_status in ["Completed", "Collected", "Depleted"]:
+            continue
+
+        if is_item_expired(item, current_time=current_time):
+            if cur_status != "Expired":
+                item["status"] = "Expired"
+                item["quarantined"] = True
+                reclassified += 1
+
+    return reclassified
 
 
 def add_item(
@@ -2793,16 +2901,16 @@ def render_sidebar(donations: list[dict[str, Any]]) -> str:
                 "➕ Donate Food",
                 "📈 Impact Report",
                 "📋 Manage Listings & Claims",
-                "🎓 Student Tasks & Deliverables",
-                "🛡️ Safety & Handling Guidelines"
+                "🛡️ Safety & Handling Guidelines",
+                "ℹ️ About the App"
             ],
             index=0
         )
 
         st.markdown("---")
 
-        # Quick stats snapshot in sidebar
-        active_count = sum(1 for d in donations if d.get("status") == "Available")
+        # Quick stats snapshot in sidebar (Food Safety Enforcement)
+        active_count = sum(1 for d in donations if get_effective_status(d) == "Available")
         claimed_count = sum(1 for d in donations if d.get("status") == "Claimed")
         completed_count = sum(1 for d in donations if d.get("status") in ["Completed", "Collected"])
         total_kg = sum(d.get("weight_kg", 0) for d in donations if d.get("status") in ["Claimed", "Completed", "Collected"])
@@ -2864,10 +2972,11 @@ def render_dashboard(donations: list[dict[str, Any]]) -> None:
     """
     render_header()
 
-    # Sustainability & Data Computations
+    # Sustainability & Data Computations (Food Safety Enforcement)
     total_listings = len(donations)
-    active_donations = [d for d in donations if d.get("status") == "Available"]
-    claimed_donations = [d for d in donations if d.get("status") == "Claimed"]
+    active_donations = [d for d in donations if get_effective_status(d) == "Available"]
+    expired_donations = [d for d in donations if get_effective_status(d) == "Expired"]
+    claimed_donations = [d for d in donations if d.get("status") == "Claimed" and not is_item_expired(d)]
     completed_donations = [d for d in donations if d.get("status") in ["Completed", "Collected"]]
 
     rescued_items = claimed_donations + completed_donations
@@ -2881,6 +2990,23 @@ def render_dashboard(donations: list[dict[str, Any]]) -> None:
 
     co2_averted_kg = round(total_kg_rescued * 2.5, 1)
     water_saved_liters = round(total_kg_rescued * 1000)
+
+    # Food Safety Quarantine Callout (if expired items are detected)
+    if expired_donations:
+        expired_meals = sum(d.get("portions", 0) for d in expired_donations)
+        st.markdown(f"""
+        <div style="background: #fffbeb; border: 1px solid #fde68a; border-left: 5px solid #d97706; border-radius: 10px; padding: 0.85rem 1.25rem; margin-bottom: 1.25rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+            <div>
+                <strong style="color: #92400e;">🛡️ Food Safety & Hygiene Protection:</strong>
+                <span style="color: #78350f; font-size: 0.9rem; margin-left: 4px;">
+                    {len(expired_donations)} surplus batch(es) ({expired_meals} meals) have passed their safe use-by deadline and were automatically quarantined from the marketplace.
+                </span>
+            </div>
+            <span style="background: #fef3c7; color: #b45309; font-weight: 700; font-size: 0.78rem; padding: 3px 10px; border-radius: 9999px;">
+                Quarantine Enforced
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
 
     # Calculate Urgent Pickups (< 6h) and Priority Expiring (Today or within 2 days / 48h)
     urgent_items = []
@@ -3279,11 +3405,11 @@ def render_find_food_page(donations: list[dict[str, Any]]) -> None:
         categories = ["All Categories", "Cooked meals", "Fruits & vegetables", "Bakery", "Dairy", "Packaged food", "Other"]
         selected_category = st.selectbox("📦 Filter by Category", categories)
 
-    # Active Listings Filter from food_listings.json
+    # Active Listings Filter from food_listings.json (Food Safety Quarantine Rule)
     active_items = []
     for item in donations:
-        # Load active listings only
-        if item.get("status") != "Available":
+        # Load active and safe non-expired listings only
+        if get_effective_status(item) != "Available" or is_item_expired(item):
             continue
 
         item_food = item.get("food_item") or item.get("title") or ""
@@ -3306,6 +3432,8 @@ def render_find_food_page(donations: list[dict[str, Any]]) -> None:
         # Freshness Status Calculation
         expiry_str = item.get("best_before") or item.get("expires_at") or ""
         freshness = get_freshness_status(expiry_str)
+        if freshness.get("is_expired"):
+            continue
         active_items.append((item, freshness))
 
     # Header counter
@@ -3649,6 +3777,7 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
     meals_donated_list = []
     meals_collected_list = []
     meals_awaiting_list = []
+    meals_expired_list = []
     table_rows_list = []
 
     for item in all_listings_list:
@@ -3669,13 +3798,22 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
         # Append to meals donated list
         meals_donated_list.append(qty_int)
 
-        status_str = str(item.get("status", "Available")).strip()
+        raw_status = str(item.get("status", "Available")).strip()
+        effective_stat = get_effective_status(item)
+        expired = is_item_expired(item) or effective_stat == "Expired"
 
-        # Categorize into redistributed/collected vs awaiting collection
-        if status_str in ["Collected", "Completed"]:
+        # Categorize into redistributed/collected vs awaiting collection vs quarantined/expired
+        if raw_status in ["Collected", "Completed"]:
+            display_status = raw_status
             meals_collected_list.append(qty_int)
+        elif expired or raw_status == "Expired":
+            display_status = "Expired (Quarantined)"
+            meals_expired_list.append(qty_int)
+        elif raw_status == "Claimed":
+            display_status = "Claimed"
+            meals_awaiting_list.append(qty_int)
         else:
-            # "Available", "Claimed", etc.
+            display_status = "Available"
             meals_awaiting_list.append(qty_int)
 
         # Extract table columns: Food name, quantity, donor, expiry date, and status
@@ -3688,8 +3826,11 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
             "Quantity": f"{qty_int} meals",
             "Donor": donor_name,
             "Expiry date": expiry_date,
-            "Status": status_str,
-            "_raw_qty": qty_int
+            "Status": display_status,
+            "_raw_qty": qty_int,
+            "_raw_status": raw_status,
+            "_effective_status": effective_stat,
+            "_is_expired": expired
         })
 
     # Accumulate totals using Python loops over the extracted lists
@@ -3705,6 +3846,10 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
     for meals in meals_awaiting_list:
         meals_awaiting += meals
 
+    meals_expired = 0
+    for meals in meals_expired_list:
+        meals_expired += meals
+
     # -------------------------------------------------------------
     # METRICS DISPLAY (STREAMLIT COLUMNS & METRIC CARDS)
     # -------------------------------------------------------------
@@ -3717,7 +3862,7 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
                 value=f"{total_food_listings:,}",
                 help="Total surplus food donation batches registered in the system"
             )
-            st.caption("Active & past surplus batches")
+            st.caption("Active, completed & quarantined batches")
 
     with col2:
         with st.container(border=True):
@@ -3746,11 +3891,27 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
             st.metric(
                 label="⏳ Meals Awaiting Collection",
                 value=f"{meals_awaiting:,}",
-                delta=f"{pct_awaiting:.1f}% pending" if total_food_listings > 0 else None,
+                delta=f"{pct_awaiting:.1f}% safe pending" if total_food_listings > 0 else None,
                 delta_color="off",
-                help="Meals currently available or claimed awaiting volunteer pickup"
+                help="Safe, unexpired meals currently available or claimed awaiting volunteer pickup"
             )
-            st.caption("Ready for pickup right now")
+            st.caption("Unexpired & safe for consumption")
+
+    # Food Safety Quarantine Callout (if expired items are present)
+    if meals_expired > 0:
+        st.markdown(f"""
+        <div style="background: #fffbeb; border: 1px solid #fde68a; border-left: 5px solid #d97706; border-radius: 10px; padding: 0.85rem 1.25rem; margin-top: 1rem; margin-bottom: 0.5rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+            <div>
+                <strong style="color: #92400e;">🛡️ Food Safety & Hygiene Audit:</strong>
+                <span style="color: #78350f; font-size: 0.9rem; margin-left: 4px;">
+                    <strong>{len(meals_expired_list)} batch(es) ({meals_expired} meals)</strong> passed their safe use-by timestamps and have been reclassified as <strong>Expired (Quarantined)</strong>. They are barred from active distribution.
+                </span>
+            </div>
+            <span style="background: #fef3c7; color: #b45309; font-weight: 700; font-size: 0.78rem; padding: 3px 10px; border-radius: 9999px;">
+                Quarantine Protocol Active
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -3800,7 +3961,7 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
     with tbl_col1:
         status_filter = st.selectbox(
             "Filter Registry by Status",
-            ["All Listings", "Available", "Claimed", "Collected / Completed"],
+            ["All Listings", "Available", "Expired (Quarantined)", "Claimed", "Collected / Completed"],
             key="impact_tbl_status"
         )
     with tbl_col2:
@@ -3814,12 +3975,18 @@ def render_impact_report_page(donations: list[dict[str, Any]]) -> None:
     filtered_table_rows = []
     for row in table_rows_list:
         # Status filter
-        if status_filter == "Available" and row["Status"] != "Available":
-            continue
-        elif status_filter == "Claimed" and row["Status"] != "Claimed":
-            continue
-        elif status_filter == "Collected / Completed" and row["Status"] not in ["Collected", "Completed"]:
-            continue
+        if status_filter == "Available":
+            if row["Status"] != "Available" or row["_is_expired"]:
+                continue
+        elif status_filter == "Expired (Quarantined)":
+            if "Expired" not in row["Status"]:
+                continue
+        elif status_filter == "Claimed":
+            if row["Status"] != "Claimed" or row["_is_expired"]:
+                continue
+        elif status_filter == "Collected / Completed":
+            if row["Status"] not in ["Collected", "Completed"]:
+                continue
 
         # Search keyword filter
         if search_kw.strip():
@@ -3967,14 +4134,24 @@ def render_manage_listings(donations: list[dict[str, Any]]) -> None:
     # TAB 2: All Surplus Listings Table
     with tab2:
         st.subheader("Master Donation Registry")
-        status_filter = st.radio("Filter By Status", ["All", "Available", "Claimed", "Completed"], horizontal=True)
+        status_filter = st.radio("Filter By Status", ["All", "Available", "Claimed", "Completed", "Expired"], horizontal=True)
 
         display_list = donations
         if status_filter != "All":
-            display_list = [d for d in donations if d.get("status") == status_filter]
+            if status_filter == "Expired":
+                display_list = [d for d in donations if get_effective_status(d) == "Expired" or d.get("status") == "Expired"]
+            elif status_filter == "Available":
+                display_list = [d for d in donations if get_effective_status(d) == "Available"]
+            else:
+                display_list = [d for d in donations if d.get("status") == status_filter and not is_item_expired(d)]
 
         table_rows = []
         for d in display_list:
+            if is_item_expired(d) and d.get("status") not in ["Completed", "Collected"]:
+                display_st = "Expired (Quarantined)"
+            else:
+                display_st = d.get("status")
+
             table_rows.append({
                 "ID": d.get("id"),
                 "Title": d.get("title"),
@@ -3985,7 +4162,7 @@ def render_manage_listings(donations: list[dict[str, Any]]) -> None:
                 "Donor": d.get("donor_name"),
                 "Area": d.get("city_area"),
                 "Expires": d.get("expires_at"),
-                "Status": d.get("status")
+                "Status": display_st
             })
 
         if table_rows:
@@ -4080,32 +4257,129 @@ def render_manage_listings(donations: list[dict[str, Any]]) -> None:
 def render_safety_guidelines():
     st.markdown("""
     <div style="margin-bottom: 1.5rem;">
-        <h2 style="color: #064e3b; font-family: 'Outfit', sans-serif; margin-bottom: 0.25rem;">🛡️ Food Safety & Hygiene Protocol</h2>
-        <p style="color: #4b5563; font-size: 0.95rem;">Surplus food donation must adhere strictly to food hygiene standards to guarantee that rescued meals are wholesome and safe for vulnerable communities.</p>
+        <div class="badge-pill-header" style="background: rgba(5, 150, 105, 0.15); border-color: #a7f3d0; color: #065f46;">
+            🛡️ ZERO COMPROMISE ON COMMUNITY HEALTH
+        </div>
+        <h2 style="color: #064e3b; font-family: 'Outfit', sans-serif; margin-bottom: 0.25rem;">
+            🛡️ Food Safety & Handling Protocol
+        </h2>
+        <p style="color: #4b5563; font-size: 0.95rem;">
+            Surplus food rescue is an act of dignity and care. To guarantee every rescued meal is nourishing and safe, all donors and volunteers must follow these clear, non-negotiable food safety standards.
+        </p>
     </div>
     """, unsafe_allow_html=True)
 
-    # Temperature Danger Zone
+    # -------------------------------------------------------------
+    # THE CRITICAL TEMPERATURE DANGER ZONE (USER-UNDERSTANDABLE EXPLANATION)
+    # -------------------------------------------------------------
     st.markdown("""
-    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 1.5rem; margin-bottom: 1.5rem;">
-        <h3 style="color: #064e3b; font-family: 'Outfit', sans-serif; margin-top: 0;">🌡️ The Critical Temperature Danger Zone</h3>
-        <p style="color: #4b5563; font-size: 0.9rem;">Bacteria multiply most rapidly between <strong>4°C (40°F) and 60°C (140°F)</strong>. Keep food either safely cold or piping hot:</p>
-        
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-top: 1rem;">
-            <div style="background: #f0fdf4; border: 1px solid #86efac; border-radius: 12px; padding: 1rem; text-align: center;">
-                <div style="font-size: 1.8rem;">❄️ Cold Holding</div>
-                <h4 style="color: #166534; margin: 0.5rem 0 0.25rem 0;">Below 4°C (40°F)</h4>
-                <p style="font-size: 0.8rem; color: #15803d; margin: 0;">Refrigerated storage for cooked items, dairy, and salads.</p>
+    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 1.75rem; margin-bottom: 1.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.5rem;">
+            <span style="font-size: 2.2rem;">🌡️</span>
+            <div>
+                <h3 style="color: #064e3b; font-family: 'Outfit', sans-serif; margin: 0; font-size: 1.35rem;">
+                    What is the Temperature Danger Zone? (Explained Simply)
+                </h3>
+                <p style="color: #4b5563; font-size: 0.9rem; margin: 0.15rem 0 0 0;">
+                    The Golden Rule of Food Safety: <strong>Keep hot food HOT, keep cold food COLD, and move through the middle as fast as possible!</strong>
+                </p>
             </div>
-            <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 12px; padding: 1rem; text-align: center;">
-                <div style="font-size: 1.8rem;">⚠️ Danger Zone</div>
-                <h4 style="color: #991b1b; margin: 0.5rem 0 0.25rem 0;">4°C to 60°C</h4>
-                <p style="font-size: 0.8rem; color: #b91c1c; margin: 0;">Do NOT leave cooked food in this zone for > 2 hours.</p>
+        </div>
+
+        <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; font-size: 0.92rem; color: #334155; line-height: 1.6;">
+            💡 <strong>Why does temperature matter so much?</strong><br>
+            Bacteria like <em>Salmonella</em>, <em>E. coli</em>, and <em>Staphylococcus</em> are living microscopic organisms. Just like humans, they cannot survive freezing cold or piping hot boiling water. But at ordinary room temperature—between <strong>4°C and 60°C (40°F to 140°F)</strong>—they thrive and multiply at staggering speed, <strong>doubling in numbers every 20 minutes!</strong> Food left in this zone quickly becomes contaminated with invisible, odorless toxins that cooking or reheating CANNOT destroy.
+        </div>
+
+        <!-- 3-Zone Visual Display Cards -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.1rem; margin-top: 1.25rem;">
+            
+            <!-- Safe Cold Zone -->
+            <div style="background: #f0fdf4; border: 2px solid #86efac; border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <span style="font-size: 1.8rem;">❄️</span>
+                        <span style="background: #dcfce7; color: #166534; font-weight: 700; font-size: 0.75rem; padding: 3px 8px; border-radius: 9999px;">
+                            SAFE COLD ZONE
+                        </span>
+                    </div>
+                    <h4 style="color: #166534; margin: 0 0 0.35rem 0; font-family: 'Outfit', sans-serif;">Below 4°C (40°F)</h4>
+                    <p style="font-size: 0.85rem; color: #15803d; line-height: 1.5; margin: 0;">
+                        <strong>Refrigerated Chill:</strong> Cold temperatures put bacteria into a state of "hibernation" (deep sleep) where they cannot reproduce or generate toxins.
+                    </p>
+                </div>
+                <div style="margin-top: 0.85rem; padding-top: 0.75rem; border-top: 1px dashed #bbf7d0; font-size: 0.8rem; color: #14532d;">
+                    🥗 <em>What belongs here:</em> Milk, paneer, yogurt, cooked curries, cut fruits, sandwiches, and fresh salads.
+                </div>
             </div>
-            <div style="background: #fff7ed; border: 1px solid #fed7aa; border-radius: 12px; padding: 1rem; text-align: center;">
-                <div style="font-size: 1.8rem;">🔥 Hot Holding</div>
-                <h4 style="color: #9a3412; margin: 0.5rem 0 0.25rem 0;">Above 60°C (140°F)</h4>
-                <p style="font-size: 0.8rem; color: #c2410c; margin: 0;">Maintain in insulated thermal boxes until recipient pickup.</p>
+
+            <!-- Danger Zone -->
+            <div style="background: #fef2f2; border: 2px solid #f87171; border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <span style="font-size: 1.8rem;">⚠️</span>
+                        <span style="background: #fee2e2; color: #991b1b; font-weight: 700; font-size: 0.75rem; padding: 3px 8px; border-radius: 9999px;">
+                            DANGER ZONE!
+                        </span>
+                    </div>
+                    <h4 style="color: #991b1b; margin: 0 0 0.35rem 0; font-family: 'Outfit', sans-serif;">4°C to 60°C (40°–140°F)</h4>
+                    <p style="font-size: 0.85rem; color: #b91c1c; line-height: 1.5; margin: 0;">
+                        <strong>Rapid Bacterial Multiplier:</strong> Typical kitchen counters, ambient dining rooms, or warm car trunks. Bacteria multiply exponentially here.
+                    </p>
+                </div>
+                <div style="margin-top: 0.85rem; padding-top: 0.75rem; border-top: 1px dashed #fecaca; font-size: 0.8rem; color: #7f1d1d;">
+                    ⏱️ <em>Urgent Rule:</em> <strong>Never let cooked surplus food sit in this zone for > 2 hours!</strong>
+                </div>
+            </div>
+
+            <!-- Safe Hot Zone -->
+            <div style="background: #fff7ed; border: 2px solid #fdba74; border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <span style="font-size: 1.8rem;">🔥</span>
+                        <span style="background: #ffedd5; color: #9a3412; font-weight: 700; font-size: 0.75rem; padding: 3px 8px; border-radius: 9999px;">
+                            SAFE HOT ZONE
+                        </span>
+                    </div>
+                    <h4 style="color: #9a3412; margin: 0 0 0.35rem 0; font-family: 'Outfit', sans-serif;">Above 60°C (140°F)</h4>
+                    <p style="font-size: 0.85rem; color: #c2410c; line-height: 1.5; margin: 0;">
+                        <strong>Steaming Hot Holding:</strong> Continuous high thermal energy kills bacteria and prevents any spores from germinating.
+                    </p>
+                </div>
+                <div style="margin-top: 0.85rem; padding-top: 0.75rem; border-top: 1px dashed #fed7aa; font-size: 0.8rem; color: #7c2d12;">
+                    🍲 <em>What belongs here:</em> Freshly cooked biryani, hot sambar, steamed rice, and gravies in insulated thermal carriers.
+                </div>
+            </div>
+
+        </div>
+
+        <!-- The 2-Hour / 4-Hour Everyday Action Rule -->
+        <div style="margin-top: 1.5rem; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1.25rem;">
+            <h4 style="color: #065f46; margin: 0 0 0.75rem 0; font-family: 'Outfit', sans-serif;">
+                ⏱️ The "2-Hour / 4-Hour" Rule in Everyday Practice
+            </h4>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; font-size: 0.86rem;">
+                <div style="background: #f0fdf4; border-left: 4px solid #16a34a; padding: 0.85rem; border-radius: 0 8px 8px 0;">
+                    <strong style="color: #166534; font-size: 0.92rem;">🟢 Under 2 Hours:</strong><br>
+                    <span style="color: #374151;">Food is fresh and safe. It can be consumed, redistributed to beneficiaries, or chilled in a refrigerator for subsequent pickup.</span>
+                </div>
+                <div style="background: #fffbeb; border-left: 4px solid #d97706; padding: 0.85rem; border-radius: 0 8px 8px 0;">
+                    <strong style="color: #92400e; font-size: 0.92rem;">🟠 2 to 4 Hours:</strong><br>
+                    <span style="color: #374151;">Food must be eaten or distributed <strong>immediately</strong>. Do NOT return it to the refrigerator or freeze it.</span>
+                </div>
+                <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 0.85rem; border-radius: 0 8px 8px 0;">
+                    <strong style="color: #991b1b; font-size: 0.92rem;">🔴 Over 4 Hours:</strong><br>
+                    <span style="color: #374151;"><strong>Unsafe & Sterile! Food must be discarded or composted.</strong> Reheating will NOT neutralize bacterial toxins. Never donate this food.</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Automatic System Quarantine Banner -->
+        <div style="margin-top: 1.25rem; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 12px; padding: 1rem 1.25rem; display: flex; align-items: flex-start; gap: 12px;">
+            <span style="font-size: 1.6rem; line-height: 1;">🛡️</span>
+            <div style="font-size: 0.88rem; color: #1e40af; line-height: 1.6;">
+                <strong>Why Our Platform Automatically Quarantines Expired Food:</strong><br>
+                Food that has passed its safe use-by window or remained unrefrigerated poses serious health risks. Our system automatically intercepts any batch where <code>expires_at &lt; current_time</code> and reclassifies its status as <strong>`Expired (Quarantined)`</strong>. It is completely locked out of the volunteer marketplace to protect vulnerable community members from foodborne illness.
             </div>
         </div>
     </div>
@@ -4152,6 +4426,163 @@ def render_safety_guidelines():
 
     with st.expander("Are donors protected from liability for donating surplus food in good faith?"):
         st.write("In many jurisdictions (such as the US Bill Emerson Good Samaritan Act and national food rescue regulations), donors who donate food in good faith to non-profit organizations without gross negligence are shielded from civil and criminal liability.")
+
+
+def render_about_page() -> None:
+    """
+    Render comprehensive platform overview, mission, workflow, and architecture guide.
+    Explains the purpose, operation, food safety protocols, and sustainability impact of the app.
+    """
+    st.markdown("""
+    <div style="margin-bottom: 1.5rem;">
+        <div class="badge-pill-header" style="background: rgba(5, 150, 105, 0.15); border-color: #a7f3d0; color: #065f46;">
+            🌱 CONNECTING SURPLUS WITH NEED
+        </div>
+        <h2 style="color: #064e3b; font-family: 'Outfit', sans-serif; margin-bottom: 0.25rem;">
+            ℹ️ About Smart Food Waste Management Platform
+        </h2>
+        <p style="color: #4b5563; font-size: 0.95rem;">
+            A real-time intelligent surplus food redistribution platform bridging food businesses, event banquets, and households with certified hunger relief NGOs and community volunteers.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Hero Mission Card
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #064e3b 0%, #047857 100%); color: #ffffff; border-radius: 16px; padding: 2rem; margin-bottom: 1.5rem; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);">
+        <div style="max-width: 820px;">
+            <span style="background: rgba(255, 255, 255, 0.2); color: #ecfdf5; font-size: 0.8rem; font-weight: 700; padding: 4px 12px; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em;">
+                Our Core Mission
+            </span>
+            <h3 style="color: #ffffff; font-family: 'Outfit', sans-serif; font-size: 1.65rem; margin: 0.75rem 0 0.5rem 0;">
+                Zero Food Waste &bull; Zero Community Hunger &bull; Measurable Climate Action
+            </h3>
+            <p style="color: #d1fae5; font-size: 0.98rem; line-height: 1.65; margin: 0;">
+                Globally, more than one-third of all food produced is discarded into municipal landfills, where it rots and emits potent methane greenhouse gases. At the very same time, millions of families face daily nutritional insecurity. The Smart Food Waste Management platform solves this distribution gap by enabling rapid, hygienic, and verified surplus food rescue before wholesome food passes safe consumption limits.
+            </p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 4 Pillars of the System
+    st.markdown("### 🌟 Four Core Pillars of the Platform")
+    p1, p2, p3, p4 = st.columns(4)
+
+    with p1:
+        with st.container(border=True):
+            st.markdown("""
+            <div style="text-align: center; padding: 0.5rem 0;">
+                <div style="font-size: 2.4rem; margin-bottom: 0.4rem;">🍲</div>
+                <h4 style="color: #065f46; margin: 0 0 0.35rem 0; font-family: 'Outfit', sans-serif;">1. Surplus Rescue</h4>
+                <p style="font-size: 0.82rem; color: #4b5563; line-height: 1.5; margin: 0;">
+                    Commercial kitchens, banquet halls, caterers, and households log excess untouched meals in under 2 minutes.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with p2:
+        with st.container(border=True):
+            st.markdown("""
+            <div style="text-align: center; padding: 0.5rem 0;">
+                <div style="font-size: 2.4rem; margin-bottom: 0.4rem;">⏱️</div>
+                <h4 style="color: #065f46; margin: 0 0 0.35rem 0; font-family: 'Outfit', sans-serif;">2. Freshness Engine</h4>
+                <p style="font-size: 0.82rem; color: #4b5563; line-height: 1.5; margin: 0;">
+                    Real-time countdown clocks categorize batches into Red (&le;24h), Orange (&le;48h), and Green (&gt;48h) urgency tiers.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with p3:
+        with st.container(border=True):
+            st.markdown("""
+            <div style="text-align: center; padding: 0.5rem 0;">
+                <div style="font-size: 2.4rem; margin-bottom: 0.4rem;">🛡️</div>
+                <h4 style="color: #065f46; margin: 0 0 0.35rem 0; font-family: 'Outfit', sans-serif;">3. Safety Quarantine</h4>
+                <p style="font-size: 0.82rem; color: #4b5563; line-height: 1.5; margin: 0;">
+                    Automated expiry enforcement locks out sterile or past-due batches, guaranteeing 100% food safety.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with p4:
+        with st.container(border=True):
+            st.markdown("""
+            <div style="text-align: center; padding: 0.5rem 0;">
+                <div style="font-size: 2.4rem; margin-bottom: 0.4rem;">🌿</div>
+                <h4 style="color: #065f46; margin: 0 0 0.35rem 0; font-family: 'Outfit', sans-serif;">4. Climate Tracking</h4>
+                <p style="font-size: 0.82rem; color: #4b5563; line-height: 1.5; margin: 0;">
+                    Scientific audit calculates verified CO₂e emissions averted (2.5 kg CO₂e / kg food) and water saved.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Detailed Explanatory Sections (Tabs)
+    tab_flow, tab_safety, tab_eco, tab_roles = st.tabs([
+        "🔄 Step-by-Step Workflow",
+        "🌡️ Temperature Danger Zone Guide",
+        "🌍 Environmental Impact Formula",
+        "👥 Who Uses This Platform?"
+    ])
+
+    with tab_flow:
+        st.subheader("How the Redistribution Loop Operates")
+        st.markdown("""
+        The platform operates on a verified, closed-loop redistribution protocol designed to maximize speed while eliminating risk:
+        
+        1. **Donor Submission (`Donate Food`):** Donors provide food title, estimated portions, dietary tags (Vegetarian, Vegan, Non-Veg), packaging type, location address, and best-before expiry date/time.
+        2. **Intelligent Freshness Scoring:** The system immediately parses the expiry timestamp, calculates remaining hours, and flags the listing with color-coded urgency badges so volunteers know what to pick up first.
+        3. **Volunteer Discovery & Claiming (`Find Food`):** Verified community volunteers, shelter homes, and registered NGOs browse active listings, filter by category or locality, and claim batches by generating a unique 4-digit Handover Code (e.g., `PICK-7821`).
+        4. **Thermal Transport & Safety Inspection:** Volunteers transport meals in insulated carriers following the Temperature Danger Zone guidelines, inspect packaging integrity, and confirm arrival.
+        5. **Handover Confirmation (`Manage Listings`):** Donor and volunteer verify the claim code to mark the listing as **Completed**, immediately feeding live transparency metrics and impact records.
+        """)
+
+    with tab_safety:
+        st.subheader("Food Safety Architecture & Quarantine Protocols")
+        st.markdown("""
+        Food safety is the foundation of community trust. The system embeds three layers of automated defense:
+        
+        - **Automatic Expiry Interception:** At all times, the system compares listed expiry timestamps with current operational time. Any batch where `expires_at < now` is dynamically marked as **`Expired (Quarantined)`** and locked out of the volunteer claiming feed.
+        - **Temperature Danger Zone Adherence:** Reminds donors and volunteers to keep cold foods strictly below **4°C (40°F)** and hot foods above **60°C (140°F)**. Food kept at room temperature (Danger Zone) must be distributed within 2 hours.
+        - **Audit Trail & Allergen Transparency:** Donors must declare dietary classifications and potential allergens (peanuts, gluten, dairy) before publication.
+        """)
+
+    with tab_eco:
+        st.subheader("The Science of Food Waste & Climate Action")
+        st.markdown("""
+        When organic food decomposes anaerobically in municipal landfills, it generates methane (CH₄)—a greenhouse gas **28 times more potent than carbon dioxide** at trapping atmospheric heat over a 100-year timescale.
+        
+        Our platform calculates ecological savings based on established United Nations FAO and EPA life-cycle analysis:
+        
+        $$\\text{CO}_2\\text{e Averted (kg)} = \\text{Total Rescued Food (kg)} \\times 2.5$$
+        $$\\text{Freshwater Conserved (L)} = \\text{Total Rescued Food (kg)} \\times 1{,}000$$
+        
+        Every rescued 100 kg of surplus food prevents **250 kg of greenhouse gases** and preserves **100,000 liters of agricultural irrigation water**!
+        """)
+
+    with tab_roles:
+        st.subheader("Platform Roles & Stakeholders")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            st.markdown("""
+            **🏢 Food Donors**
+            - Commercial hotels, buffet caterers, and corporate dining halls
+            - Neighborhood restaurants, bakeries, and cafes
+            - Supermarkets and produce markets
+            - Event organizers and large private family celebrations
+            
+            *Benefits:* Eliminates waste disposal costs, fulfills Corporate Social Responsibility (CSR), and earns verifiable sustainability reports.
+            """)
+        with col_r2:
+            st.markdown("""
+            **🤝 Food Rescuers & Beneficiaries**
+            - Registered charitable NGOs and volunteer networks (Robin Hood Army, community fridges)
+            - Shelter homes, orphanages, and senior care centers
+            - Disaster response teams and migrant worker communities
+            
+            *Benefits:* Access to fresh, safe, high-protein meals with real-time location and freshness visibility.
+            """)
 
 
 # ==========================================
@@ -4510,10 +4941,12 @@ def main() -> None:
         render_impact_report_page(donations)
     elif current_page in ["📋 Manage Listings & Claims", "📋 Manage Listings & Handovers"]:
         render_manage_listings(donations)
-    elif current_page == "🎓 Student Tasks & Deliverables":
-        render_student_tasks_page(donations)
     elif current_page == "🛡️ Safety & Handling Guidelines":
         render_safety_guidelines()
+    elif current_page in ["ℹ️ About the App", "About"]:
+        render_about_page()
+    elif current_page == "🎓 Student Tasks & Deliverables":
+        render_about_page()
 
     # Footer
     render_footer()

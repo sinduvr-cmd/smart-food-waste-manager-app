@@ -47,7 +47,11 @@ from app import (
     init_sqlite_db,
     sync_to_sqlite,
     load_from_sqlite,
-    generate_daily_expiry_report
+    generate_daily_expiry_report,
+    is_item_expired,
+    get_effective_status,
+    sync_expired_statuses,
+    get_freshness_status
 )
 
 
@@ -567,6 +571,92 @@ class TestSection11MinimumTestScenarios(unittest.TestCase):
         self.assertIn("DAILY FOOD EXPIRY", report)
         self.assertIn("Expired", report)
         self.assertIn("Expiring-Soon", report)
+
+
+class TestFoodSafetyExpiryQuarantine(unittest.TestCase):
+    """
+    Verification of food safety quarantine protocols:
+    - Items past expiry timestamp cannot be 'Available'
+    - Effective status dynamically reclassifies to 'Expired'
+    - get_freshness_status labels expired food with '🚨 Expired'
+    - sync_expired_statuses quarantines all past-due items
+    """
+
+    def setUp(self):
+        self.operating_date = "2026-10-05"
+        self.past_item = {
+            "id": "DON-1001",
+            "name": "Royal Hyderabadi Veg Dum Biryani",
+            "title": "Royal Hyderabadi Veg Dum Biryani",
+            "category": "Cooked Meals",
+            "portions": 65,
+            "weight_kg": 26.0,
+            "donor_name": "Grand Palace Banquet Hall",
+            "prepared_at": "2026-10-01 16:51",
+            "expires_at": "2026-10-01 21:06",
+            "expiry_date": "2026-10-01",
+            "status": "Available"
+        }
+        self.future_item = {
+            "id": "DON-1008",
+            "name": "Steamed Idli Breakfast Combos",
+            "title": "Steamed Idli Breakfast Combos",
+            "category": "Cooked Meals",
+            "portions": 45,
+            "weight_kg": 18.0,
+            "donor_name": "Annapoorna Tiffin Center",
+            "prepared_at": "2026-10-05 14:00",
+            "expires_at": (dt.now() + timedelta(hours=6)).strftime("%Y-%m-%d %H:%M"),
+            "expiry_date": (dt.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
+            "status": "Available"
+        }
+        self.completed_item = {
+            "id": "DON-1007",
+            "name": "High-Tea Sandwiches",
+            "title": "High-Tea Sandwiches",
+            "category": "Bakery",
+            "portions": 70,
+            "weight_kg": 22.0,
+            "prepared_at": "2026-10-01 11:51",
+            "expires_at": "2026-10-01 17:51",
+            "status": "Completed"
+        }
+
+    def test_past_expiry_marked_expired_not_available(self):
+        """Food past safe use-by/expiry date is strictly expired and never available."""
+        self.assertTrue(is_item_expired(self.past_item, current_time=self.operating_date))
+        effective = get_effective_status(self.past_item, current_time=self.operating_date)
+        self.assertEqual(effective, "Expired")
+        self.assertNotEqual(effective, "Available")
+
+    def test_future_expiry_remains_available(self):
+        """Uncollected food before expiry date remains available."""
+        self.assertFalse(is_item_expired(self.future_item))
+        effective = get_effective_status(self.future_item)
+        self.assertEqual(effective, "Available")
+
+    def test_completed_item_preserves_completed_status(self):
+        """Food already completed/handed over remains 'Completed'."""
+        effective = get_effective_status(self.completed_item, current_time=self.operating_date)
+        self.assertEqual(effective, "Completed")
+
+    def test_sync_expired_statuses_quarantines_inventory(self):
+        """sync_expired_statuses updates stored status and flags quarantined=True."""
+        inv = [dict(self.past_item), dict(self.future_item), dict(self.completed_item)]
+        reclassified = sync_expired_statuses(inv, current_time=self.operating_date)
+        self.assertEqual(reclassified, 1)
+        self.assertEqual(inv[0]["status"], "Expired")
+        self.assertTrue(inv[0].get("quarantined"))
+        self.assertEqual(inv[1]["status"], "Available")
+        self.assertEqual(inv[2]["status"], "Completed")
+
+    def test_get_freshness_status_for_past_date(self):
+        """get_freshness_status classifies elapsed dates as Expired tier."""
+        freshness = get_freshness_status("2026-10-01 21:06")
+        self.assertEqual(freshness["tier"], "Expired")
+        self.assertTrue(freshness.get("is_expired"))
+        self.assertIn("Expired", freshness["label"])
+        self.assertNotIn("Collect Today", freshness["label"])
 
 
 if __name__ == "__main__":
